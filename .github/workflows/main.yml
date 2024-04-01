@@ -117,7 +117,7 @@ jobs:
           cd /home/ubuntu
           mkdir app
           cd app
-          git clone https://github.com/dkrishnapavani/devops-aws.git
+          git clone https://github.com/vinprogramming/docker-frontend-backend-db.git
           cd devops-aws
           echo "REACT_APP_API_URL=http://${{ needs.infra.outputs.instance-public-ip }}:3001/api" > frontend/.env.development
           sudo docker build -t myfrontendimage:latest ./frontend
