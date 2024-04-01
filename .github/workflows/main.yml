@@ -1,2 +1,157 @@
-name: Deploy to AWS
-on: workflow_dispatch
+name: EC2 Deployment Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_infra:
+        required: true
+        default: false
+        description: Create Infrastructure on AWS?
+        type: boolean
+      initial_deploy:
+        required: true
+        default: false
+        description: Initial deployment? Depends on Create Infra
+        type: boolean
+      ssh_key_name:
+        required: true
+        description: SSH Key Name to create
+        type: string
+      update_code:
+        required: false
+        description: Update code?
+        type: boolean
+        default: false
+      instance_id:
+        required: false
+        description: EC2 instance id to update code
+        type: string
+        
+
+jobs:
+  infra:
+    if: ${{ github.event.inputs.create_infra == 'true' }}
+    runs-on: ubuntu-latest
+    environment: bca_project
+    outputs:
+      instance-public-ip: ${{ steps.launch_instance.outputs.instance_public_ip }}
+    steps:
+      - name: Install AWS CLI
+        run: sudo apt-get install awscli
+      - name: Configure AWS CLI
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+      - name: Create SSH Key Pair
+        id: create_key
+        run: |
+          aws ec2 create-key-pair --key-name ${{ github.event.inputs.ssh_key_name }} --query 'KeyMaterial' --output text > ${{ github.event.inputs.ssh_key_name }}.pem
+          chmod 600 ${{ github.event.inputs.ssh_key_name }}.pem
+      - name: Upload PEM file as an artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: ssh-key
+          path: ${{ github.event.inputs.ssh_key_name }}.pem
+      - name: Create VPC
+        id: create_vpc
+        run: |
+          echo "VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 --query 'Vpc.VpcId' --output text)" >> $GITHUB_ENV
+      
+      - name: Create Subnet
+        run: |
+          echo "SUBNET_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 --availability-zone ap-south-1a --query 'Subnet.SubnetId' --output text)" >> $GITHUB_ENV
+      
+      - name: Create Internet Gateway and Attach to VPC
+        run: |
+          IGW_ID=$(aws ec2 create-internet-gateway --query 'InternetGateway.InternetGatewayId' --output text)
+          aws ec2 attach-internet-gateway --vpc-id $VPC_ID --internet-gateway-id $IGW_ID
+          echo "IGW_ID=$IGW_ID" >> $GITHUB_ENV
+      
+      - name: Create Route Table and Associate with Subnet
+        run: |
+          RTB_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID --query 'RouteTable.RouteTableId' --output text)
+          aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $SUBNET_ID
+          aws ec2 create-route --route-table-id $RTB_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+      
+      - name: Create Security Group and Setup SSH
+        run: |
+          SG_ID=$(aws ec2 create-security-group --group-name my-ssh-sg --description "SSH access" --vpc-id $VPC_ID --query 'GroupId' --output text)
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3000 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3001 --cidr 0.0.0.0/0
+          echo "SG_ID=$SG_ID" >> $GITHUB_ENV
+      
+      - name: Launch EC2 Instance and Get Public IP
+        id: launch_instance
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances --image-id ami-03f4878755434977f --count 1 --instance-type t2.micro --key-name ${{ github.event.inputs.ssh_key_name }} --security-group-ids $SG_ID --subnet-id $SUBNET_ID --associate-public-ip-address --placement AvailabilityZone=ap-south-1a --query 'Instances[0].InstanceId' --output text)
+          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "::set-output name=instance_public_ip::$PUBLIC_IP"
+
+  build_deploy:
+    needs: infra
+    if: ${{ github.event.inputs.initial_deploy == 'true' }}
+    runs-on: ubuntu-latest
+    environment: bca_project
+    steps:
+      - name: Download SSH Key PEM file
+        uses: actions/download-artifact@v2
+        with:
+          name: ssh-key
+          path: . 
+      - name: Correct PEM file permissions
+        run: chmod 600 ${{ github.event.inputs.ssh_key_name }}.pem
+      - name: SSH into EC2 Instance & Build Images
+        run: |
+          ssh -o StrictHostKeyChecking=no -i ${{ github.event.inputs.ssh_key_name }}.pem ubuntu@${{ needs.infra.outputs.instance-public-ip }} << 'EOF'
+          curl -fsSL https://get.docker.com -o get-docker.sh
+          sudo sh get-docker.sh
+          sudo systemctl start docker
+          sudo systemctl enable docker
+          sudo apt-get install docker-compose -y
+          cd /home/ubuntu
+          mkdir app
+          cd app
+          git clone https://github.com/dkrishnapavani/devops-aws.git
+          cd devops-aws
+          echo "REACT_APP_API_URL=http://${{ needs.infra.outputs.instance-public-ip }}:3001/api" > frontend/.env.development
+          sudo docker build -t myfrontendimage:latest ./frontend
+          sudo docker build -t mybackendimage:latest ./backend
+          sudo docker-compose up -d
+          EOF
+  update_code:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.update_code == 'true' }}
+    steps:
+      - name: Configure AWS CLI
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: 'ap-south-1'
+
+      - name: Retrieve Public IP of the EC2 Instance
+        id: get_ip
+        run: |
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids ${{ github.event.inputs.ec2_instance_id }} --query 'Reservations[].Instances[].PublicIpAddress' --output text)
+          echo "INSTANCE_PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "::set-output name=instance_public_ip::$PUBLIC_IP"
+
+      - name: Decode SSH Private Key
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" | base64 --decode > ec2_ssh_key.pem
+          chmod 400 ec2_ssh_key.pem
+
+      - name: Update Code and Restart Services on the EC2 Instance
+        run: |
+          ssh -o StrictHostKeyChecking=no -i ec2_ssh_key.pem ubuntu@${{ steps.get_ip.outputs.instance_public_ip }} << 'EOF'
+            cd /home/ubuntu/app/devops-aws 
+            git pull origin main
+            sudo docker-compose down
+            sudo docker-compose up -d
+          EOF
