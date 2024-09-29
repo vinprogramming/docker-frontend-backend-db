@@ -45,6 +45,7 @@ jobs:
       - name: Install eksctl
         run: |
           chmod +x ./install-eksctl.sh
+          dos2unix ./install-eksctl.sh
           ./install-eksctl.sh
 
       - name: Create EKS Cluster
