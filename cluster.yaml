@@ -1,1 +1,16 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
 
+metadata:
+  name: ${{ env.CLUSTER_NAME }}
+  region: ap-south-1
+  version: "1.27"
+
+managedNodeGroups:
+  - name: ${{ env.NODE_GROUP_NAME }}
+    instanceType: t3.medium
+    minSize: 1
+    maxSize: 4
+    desiredCapacity: 3
+    iam:
+      instanceRoleARN: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.CLUSTER_ROLE }}
