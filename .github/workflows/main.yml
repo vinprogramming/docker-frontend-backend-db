@@ -47,11 +47,6 @@ jobs:
           chmod +x ./install-eksctl.sh
           ./install-eksctl.sh
 
-      - name: Create IAM Role for EKS
-        run: |
-          aws iam create-role --role-name ${{ env.CLUSTER_ROLE }} --assume-role-policy-document file://trust-policy.json
-          aws iam attach-role-policy --role-name ${{ env.CLUSTER_ROLE }} --policy-arn arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
-
       - name: Create EKS Cluster
         run: |
           eksctl create cluster \
@@ -66,23 +61,12 @@ jobs:
             --managed \
             --node-role ${{ env.CLUSTER_ROLE }}
 
-      - name: Get Node Group IAM Role
-        id: get-nodegroup-role
-        run: |
-          NODEGROUP_ROLE=$(aws eks describe-nodegroup --cluster-name ${{ env.CLUSTER_NAME }} --nodegroup-name ${{ env.NODE_GROUP_NAME }} --region ap-south-1 --query "nodegroup.nodeRole" --output text)
-          echo "::set-output name=nodegroup-role::${NODEGROUP_ROLE}"
-
-      - name: Attach ECR ReadOnly Policy
-        run: |
-          aws iam attach-role-policy \
-            --role-name ${{ steps.get-nodegroup-role.outputs.nodegroup-role }} \
-            --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
-
-      - name: Get Kubeconfig
+      - name: Get Kubeconfig and Upload as Artifact
         run: |
           aws eks --region ap-south-1 update-kubeconfig --name ${{ env.CLUSTER_NAME }}
+        continue-on-error: false
 
-      - name: Upload kubeconfig
+      - name: Upload kubeconfig as artifact
         uses: actions/upload-artifact@v3
         with:
           name: kubeconfig
@@ -139,12 +123,21 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      - name: Download kubeconfig
+      # Try to download the kubeconfig from the previous job artifact
+      - name: Download kubeconfig from artifact
         uses: actions/download-artifact@v3
+        id: download_kubeconfig
         with:
           name: kubeconfig
-          path: $HOME/.kube
+        continue-on-error: true
 
+      # If the kubeconfig artifact is not found, use the GitHub Secret to set up kubeconfig
+      - name: Set kubeconfig from secret if artifact not found
+        if: failure()  # Only run if the previous step failed
+        run: |
+          echo "${{ secrets.KUBECONFIG_SECRET }}" > $HOME/.kube/config
+
+      # Verify kubeconfig is set up correctly
       - name: Install kubectl
         run: |
           curl -O https://s3.us-west-2.amazonaws.com/amazon-eks/1.31.0/2024-09-12/bin/linux/arm64/kubectl
@@ -156,14 +149,9 @@ jobs:
           export KUBECONFIG=$HOME/.kube/config
           kubectl get nodes
 
-      # Step to deploy the StorageClass from a file in the repo
-      - name: Deploy EBS StorageClass
-        run: |
-          kubectl apply -f storageclass.yaml -n bca_project
-
+      # Deploy your application resources
       - name: Deploy Application
         run: |
-          kubectl create namespace bca_project
           kubectl apply -f frontend-deployment.yaml -n bca_project
           kubectl apply -f frontend-service.yaml -n bca_project
           kubectl apply -f backend-deployment.yaml -n bca_project
