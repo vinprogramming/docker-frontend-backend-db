@@ -3,8 +3,16 @@ name: EKS Cluster Workflow
 on:
   workflow_dispatch:
     inputs:
+      cluster_name:
+        description: 'Base name for the EKS cluster, node group, and IAM role'
+        required: true
+        type: string
       create_infra:
         description: 'Run the infrastructure creation stage'
+        required: true
+        type: boolean
+      build_push:
+        description: 'Build and push Docker images for frontend and backend'
         required: true
         type: boolean
       deploy_app:
@@ -13,18 +21,14 @@ on:
         type: boolean
 
 jobs:
-  # Stage 1: Create Infrastructure
   create_infra:
     if: ${{ github.event.inputs.create_infra == 'true' }}
     runs-on: ubuntu-latest
-    environment:
-      name: bca_project
+    environment: bca_project
     steps:
-      # Checkout the repository
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      # Set up AWS CLI
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
@@ -32,76 +36,160 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-south-1
 
-      # Install eksctl
+      - name: Set cluster, role, and node group names
+        run: |
+          echo "CLUSTER_NAME=${{ github.event.inputs.cluster_name }}" >> $GITHUB_ENV
+          echo "CLUSTER_ROLE=${{ github.event.inputs.cluster_name }}-role" >> $GITHUB_ENV
+          echo "NODE_GROUP_NAME=${{ github.event.inputs.cluster_name }}-nodes" >> $GITHUB_ENV
+
       - name: Install eksctl
         run: |
           chmod +x ./install-eksctl.sh
           ./install-eksctl.sh
 
-      # Create IAM Role for EKS
-      - name: Create IAM Role
+      - name: Create IAM Role for EKS
         run: |
-          aws iam create-role --role-name eksClusterRole --assume-role-policy-document file://trust-policy.json
-          aws iam attach-role-policy --role-name eksClusterRole --policy-arn arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+          aws iam create-role --role-name ${{ env.CLUSTER_ROLE }} --assume-role-policy-document file://trust-policy.json
+          aws iam attach-role-policy --role-name ${{ env.CLUSTER_ROLE }} --policy-arn arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
 
-      # Create EKS Cluster with eksctl
       - name: Create EKS Cluster
         run: |
           eksctl create cluster \
-            --name bca-final-project \
+            --name ${{ env.CLUSTER_NAME }} \
             --version 1.27 \
             --region ap-south-1 \
-            --nodegroup-name bca-project-nodes \
+            --nodegroup-name ${{ env.NODE_GROUP_NAME }} \
             --node-type t3.medium \
             --nodes 3 \
             --nodes-min 1 \
             --nodes-max 4 \
-            --managed
+            --managed \
+            --node-role ${{ env.CLUSTER_ROLE }}
 
-      # Get kubeconfig file
+      - name: Get Node Group IAM Role
+        id: get-nodegroup-role
+        run: |
+          NODEGROUP_ROLE=$(aws eks describe-nodegroup --cluster-name ${{ env.CLUSTER_NAME }} --nodegroup-name ${{ env.NODE_GROUP_NAME }} --region ap-south-1 --query "nodegroup.nodeRole" --output text)
+          echo "::set-output name=nodegroup-role::${NODEGROUP_ROLE}"
+
+      - name: Attach ECR ReadOnly Policy
+        run: |
+          aws iam attach-role-policy \
+            --role-name ${{ steps.get-nodegroup-role.outputs.nodegroup-role }} \
+            --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
       - name: Get Kubeconfig
         run: |
-          aws eks --region us-west-2 update-kubeconfig --name my-cluster
-        continue-on-error: false
+          aws eks --region ap-south-1 update-kubeconfig --name ${{ env.CLUSTER_NAME }}
 
-      # Save kubeconfig as artifact for next stage
       - name: Upload kubeconfig
         uses: actions/upload-artifact@v3
         with:
           name: kubeconfig
           path: $HOME/.kube/config
 
-  # Stage 2: Deploy Application
-  deploy_app:
-    if: ${{ github.event.inputs.deploy_app == 'true' }}
+  build_push:
+    if: ${{ github.event.inputs.build_push == 'true' }}
     needs: create_infra
     runs-on: ubuntu-latest
+    environment: bca_project
     steps:
-      # Checkout the repository
       - name: Checkout Code
         uses: actions/checkout@v3
 
-      # Download kubeconfig from previous stage
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo systemctl enable docker
+
+      - name: Log in to ECR
+        run: |
+          aws ecr get-login-password --region ap-south-1 | sudo docker login --username AWS --password-stdin 438017212388.dkr.ecr.ap-south-1.amazonaws.com
+
+      - name: Build and Push Frontend Image
+        run: |
+          FRONTEND_REPO_URI="438017212388.dkr.ecr.ap-south-1.amazonaws.com/bca-todo/frontend"
+          cd frontend
+          echo "REACT_APP_API_URL=http://api.bca-project.svc.cluster.local:3001/api" > .env.production
+          sudo docker build -t frontend .
+          sudo docker tag frontend:latest $FRONTEND_REPO_URI:latest
+          sudo docker push $FRONTEND_REPO_URI:latest
+
+      - name: Build and Push Backend Image
+        run: |
+          BACKEND_REPO_URI="438017212388.dkr.ecr.ap-south-1.amazonaws.com/bca-todo/backend"
+          cd ../backend
+          sudo docker build -t backend .
+          sudo docker tag backend:latest $BACKEND_REPO_URI:latest
+          sudo docker push $BACKEND_REPO_URI:latest
+
+  deploy_app:
+    if: ${{ github.event.inputs.deploy_app == 'true' }}
+    needs: [create_infra, build_push]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
       - name: Download kubeconfig
         uses: actions/download-artifact@v3
         with:
           name: kubeconfig
           path: $HOME/.kube
 
-      # Install kubectl
       - name: Install kubectl
         run: |
           curl -O https://s3.us-west-2.amazonaws.com/amazon-eks/1.31.0/2024-09-12/bin/linux/arm64/kubectl
           chmod +x ./kubectl
           sudo mv ./kubectl /usr/local/bin/kubectl
 
-      # Set KUBECONFIG environment variable
       - name: Configure kubectl
         run: |
           export KUBECONFIG=$HOME/.kube/config
           kubectl get nodes
 
-      # Deploy Application (you can add your kubectl apply commands here)
+      # Step to deploy the StorageClass from a file in the repo
+      - name: Deploy EBS StorageClass
+        run: |
+          kubectl apply -f storageclass.yaml -n bca_project
+
       - name: Deploy Application
         run: |
-          echo "Deploy your app using kubectl here!"
+          kubectl apply -f frontend-deployment.yaml -n bca_project
+          kubectl apply -f frontend-service.yaml -n bca_project
+          kubectl apply -f backend-deployment.yaml -n bca_project
+          kubectl apply -f backend-service.yaml -n bca_project
+          kubectl apply -f mongo-statefulset.yaml -n bca_project
+          kubectl apply -f mongo-service.yaml -n bca_project
+
+      - name: Wait for LoadBalancer IP
+        run: |
+          echo "Waiting for LoadBalancer IP to be assigned..."
+          for i in {1..20}; do
+            EXTERNAL_IP=$(kubectl get svc frontend -n bca_project -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -z "$EXTERNAL_IP" ]; then
+              echo "Waiting for LoadBalancer IP..."
+              sleep 30
+            else
+              echo "LoadBalancer IP assigned: $EXTERNAL_IP"
+              break
+            fi
+          done
+          if [ -z "$EXTERNAL_IP" ]; then
+            echo "Failed to get LoadBalancer IP after waiting for 10 minutes."
+            exit 1
+          fi
+
+      - name: Output LoadBalancer URL
+        run: |
+          EXTERNAL_IP=$(kubectl get svc frontend -n bca_project -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "Frontend Application URL: http://$EXTERNAL_IP"
