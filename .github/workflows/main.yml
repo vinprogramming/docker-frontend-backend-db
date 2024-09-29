@@ -163,6 +163,7 @@ jobs:
 
       - name: Deploy Application
         run: |
+          kubectl create namespace bca_project
           kubectl apply -f frontend-deployment.yaml -n bca_project
           kubectl apply -f frontend-service.yaml -n bca_project
           kubectl apply -f backend-deployment.yaml -n bca_project
