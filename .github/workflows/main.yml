@@ -1,2 +1,107 @@
-name: Deploy to AWS
-on: workflow_dispatch
+name: EKS Cluster Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_infra:
+        description: 'Run the infrastructure creation stage'
+        required: true
+        type: boolean
+      deploy_app:
+        description: 'Run the deployment stage'
+        required: true
+        type: boolean
+
+jobs:
+  # Stage 1: Create Infrastructure
+  create_infra:
+    if: ${{ github.event.inputs.create_infra == 'true' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: bca_project
+    steps:
+      # Checkout the repository
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      # Set up AWS CLI
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      # Install eksctl
+      - name: Install eksctl
+        run: |
+          chmod +x ./install-eksctl.sh
+          ./install-eksctl.sh
+
+      # Create IAM Role for EKS
+      - name: Create IAM Role
+        run: |
+          aws iam create-role --role-name eksClusterRole --assume-role-policy-document file://trust-policy.json
+          aws iam attach-role-policy --role-name eksClusterRole --policy-arn arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+      # Create EKS Cluster with eksctl
+      - name: Create EKS Cluster
+        run: |
+          eksctl create cluster \
+            --name bca-final-project \
+            --version 1.27 \
+            --region ap-south-1 \
+            --nodegroup-name bca-project-nodes \
+            --node-type t3.medium \
+            --nodes 3 \
+            --nodes-min 1 \
+            --nodes-max 4 \
+            --managed
+
+      # Get kubeconfig file
+      - name: Get Kubeconfig
+        run: |
+          aws eks --region us-west-2 update-kubeconfig --name my-cluster
+        continue-on-error: false
+
+      # Save kubeconfig as artifact for next stage
+      - name: Upload kubeconfig
+        uses: actions/upload-artifact@v3
+        with:
+          name: kubeconfig
+          path: $HOME/.kube/config
+
+  # Stage 2: Deploy Application
+  deploy_app:
+    if: ${{ github.event.inputs.deploy_app == 'true' }}
+    needs: create_infra
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout the repository
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      # Download kubeconfig from previous stage
+      - name: Download kubeconfig
+        uses: actions/download-artifact@v3
+        with:
+          name: kubeconfig
+          path: $HOME/.kube
+
+      # Install kubectl
+      - name: Install kubectl
+        run: |
+          curl -O https://s3.us-west-2.amazonaws.com/amazon-eks/1.31.0/2024-09-12/bin/linux/arm64/kubectl
+          chmod +x ./kubectl
+          sudo mv ./kubectl /usr/local/bin/kubectl
+
+      # Set KUBECONFIG environment variable
+      - name: Configure kubectl
+        run: |
+          export KUBECONFIG=$HOME/.kube/config
+          kubectl get nodes
+
+      # Deploy Application (you can add your kubectl apply commands here)
+      - name: Deploy Application
+        run: |
+          echo "Deploy your app using kubectl here!"
