@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: frontend
-  namespace: bca-project
+  namespace: bca_project
 spec:
   replicas: 2
   selector:
@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: frontend
-        image: <aws_account_id>.dkr.ecr.us-west-2.amazonaws.com/bca-todo/frontend:latest
+        image: 438017212388.dkr.ecr.ap-south-1.amazonaws.com/bca-todo/frontend:latest
         ports:
         - containerPort: 3000
         env:
