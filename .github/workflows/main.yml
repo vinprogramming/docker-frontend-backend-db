@@ -119,7 +119,6 @@ jobs:
         run: |
           FRONTEND_REPO_URI="438017212388.dkr.ecr.ap-south-1.amazonaws.com/bca-todo/frontend"
           cd frontend
-          echo "REACT_APP_API_URL=http://api.bca-project.svc.cluster.local:3001/api" > .env.production
           sudo docker build -t frontend .
           sudo docker tag frontend:latest $FRONTEND_REPO_URI:latest
           sudo docker push $FRONTEND_REPO_URI:latest
