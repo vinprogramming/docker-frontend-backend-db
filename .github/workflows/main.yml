@@ -68,17 +68,22 @@ jobs:
 
       - name: Create EKS Cluster
         run: |
+          # Create the EKS cluster without node groups
           eksctl create cluster \
             --name ${{ env.CLUSTER_NAME }} \
             --version 1.27 \
             --region ap-south-1 \
-            --nodegroup-name ${{ env.NODE_GROUP_NAME }} \
+            --without-nodegroup
+          
+          # Create the managed node group with the specified IAM role
+          eksctl create nodegroup \
+            --cluster ${{ env.CLUSTER_NAME }} \
+            --name ${{ env.NODE_GROUP_NAME }} \
+            --node-role ${{ env.CLUSTER_ROLE }} \
             --node-type t3.medium \
             --nodes 3 \
             --nodes-min 1 \
-            --nodes-max 4 \
-            --managed \
-            --node-role ${{ env.CLUSTER_ROLE }}
+            --nodes-max 4
 
       - name: Get Kubeconfig and Upload as Artifact
         run: |
