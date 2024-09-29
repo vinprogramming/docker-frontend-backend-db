@@ -66,6 +66,11 @@ jobs:
               --policy-arn arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
             
 
+      - name: Replace placeholders in cluster.yaml
+        run: |
+          sed -i 's/<cluster-name>/${{ github.event.inputs.cluster_name }}/g' cluster.yaml
+          sed -i 's/<node-group-name>/${{ github.event.inputs.cluster_name }}-nodes/g' cluster.yaml
+          sed -i 's/<role-name>/${{ github.event.inputs.cluster_name }}-role/g' cluster.yaml
       - name: Create EKS Cluster
         run: eksctl create cluster -f cluster.yaml
 
