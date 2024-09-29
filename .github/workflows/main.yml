@@ -1,196 +1,181 @@
-name: EKS Cluster Workflow
+name: EC2 Deployment Workflow
 
 on:
   workflow_dispatch:
     inputs:
-      cluster_name:
-        description: 'Base name for the EKS cluster, node group, and IAM role'
-        required: true
-        type: string
       create_infra:
-        description: 'Run the infrastructure creation stage'
         required: true
+        default: false
+        description: Create Infrastructure on AWS?
         type: boolean
-      build_push:
-        description: 'Build and push Docker images for frontend and backend'
+      initial_deploy:
         required: true
+        default: false
+        description: Initial deployment? Depends on Create Infra
         type: boolean
-      deploy_app:
-        description: 'Run the deployment stage'
+      ssh_key_name:
         required: true
+        description: SSH Key Name to create
+        type: string
+      update_code:
+        required: false
+        description: Update code?
         type: boolean
+        default: false
+      instance_id:
+        required: false
+        description: EC2 instance id to update code
+        type: string
+        
 
 jobs:
-  create_infra:
+  infra:
     if: ${{ github.event.inputs.create_infra == 'true' }}
     runs-on: ubuntu-latest
     environment: bca_project
+    outputs:
+      instance-public-ip: ${{ steps.launch_instance.outputs.instance_public_ip }}
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
+      - name: Install AWS CLI
+        run: sudo apt-get install awscli
+      - name: Configure AWS CLI
+        uses: aws-actions/configure-aws-credentials@v1
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-south-1
-
-      - name: Set cluster, role, and node group names
+      - name: Create SSH Key Pair
+        id: create_key
         run: |
-          echo "CLUSTER_NAME=${{ github.event.inputs.cluster_name }}" >> $GITHUB_ENV
-          echo "CLUSTER_ROLE=${{ github.event.inputs.cluster_name }}-role" >> $GITHUB_ENV
-          echo "NODE_GROUP_NAME=${{ github.event.inputs.cluster_name }}-nodes" >> $GITHUB_ENV
-
-      - name: Install eksctl
-        run: |
-          chmod +x ./install-eksctl.sh
-          ./install-eksctl.sh
-      - name: Create IAM role for worker nodes
-        run: |
-          aws iam create-role \
-              --role-name ${{ env.CLUSTER_ROLE }} \
-              --assume-role-policy-document file://trust-policy.json
-      - name: Attach IAM role
-        run: |
-          aws iam attach-role-policy \
-              --role-name ${{ env.CLUSTER_ROLE }} \
-              --policy-arn arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
-          
-          aws iam attach-role-policy \
-              --role-name ${{ env.CLUSTER_ROLE }} \
-              --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
-          
-          aws iam attach-role-policy \
-              --role-name ${{ env.CLUSTER_ROLE }} \
-              --policy-arn arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
-            
-
-      - name: Replace placeholders in cluster.yaml
-        run: |
-          sed -i 's/<cluster-name>/${{ github.event.inputs.cluster_name }}/g' cluster.yaml
-          sed -i 's/<node-group-name>/${{ github.event.inputs.cluster_name }}-nodes/g' cluster.yaml
-          sed -i 's/<role-name>/${{ github.event.inputs.cluster_name }}-role/g' cluster.yaml
-      - name: Create EKS Cluster
-        run: eksctl create cluster -f cluster.yaml
-
-      - name: Get Kubeconfig and Upload as Artifact
-        run: |
-          aws eks --region ap-south-1 update-kubeconfig --name ${{ env.CLUSTER_NAME }}
-        continue-on-error: false
-
-      - name: Upload kubeconfig as artifact
-        uses: actions/upload-artifact@v3
+          aws ec2 create-key-pair --key-name ${{ github.event.inputs.ssh_key_name }} --query 'KeyMaterial' --output text > ${{ github.event.inputs.ssh_key_name }}.pem
+          chmod 600 ${{ github.event.inputs.ssh_key_name }}.pem
+      - name: Upload PEM file as an artifact
+        uses: actions/upload-artifact@v2
         with:
-          name: kubeconfig
-          path: $HOME/.kube/config
+          name: ssh-key
+          path: ${{ github.event.inputs.ssh_key_name }}.pem
+      - name: Create VPC
+        id: create_vpc
+        run: |
+          echo "VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 --query 'Vpc.VpcId' --output text)" >> $GITHUB_ENV
+      
+      - name: Create Subnet
+        run: |
+          echo "SUBNET_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 --availability-zone ap-south-1a --query 'Subnet.SubnetId' --output text)" >> $GITHUB_ENV
+      
+      - name: Create Internet Gateway and Attach to VPC
+        run: |
+          IGW_ID=$(aws ec2 create-internet-gateway --query 'InternetGateway.InternetGatewayId' --output text)
+          aws ec2 attach-internet-gateway --vpc-id $VPC_ID --internet-gateway-id $IGW_ID
+          echo "IGW_ID=$IGW_ID" >> $GITHUB_ENV
+      
+      - name: Create Route Table and Associate with Subnet
+        run: |
+          RTB_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID --query 'RouteTable.RouteTableId' --output text)
+          aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $SUBNET_ID
+          aws ec2 create-route --route-table-id $RTB_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+      
+      - name: Create Security Group and Setup SSH
+        run: |
+          SG_ID=$(aws ec2 create-security-group --group-name my-ssh-sg --description "SSH access" --vpc-id $VPC_ID --query 'GroupId' --output text)
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3000 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3001 --cidr 0.0.0.0/0
+          echo "SG_ID=$SG_ID" >> $GITHUB_ENV
+      
+      - name: Launch EC2 Instance and Get Public IP
+        id: launch_instance
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances --image-id ami-03f4878755434977f --count 1 --instance-type t2.micro --key-name ${{ github.event.inputs.ssh_key_name }} --security-group-ids $SG_ID --subnet-id $SUBNET_ID --associate-public-ip-address --placement AvailabilityZone=ap-south-1a --query 'Instances[0].InstanceId' --output text)
+          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "::set-output name=instance_public_ip::$PUBLIC_IP"
 
-  build_push:
-    if: ${{ github.event.inputs.build_push == 'true' }}
-    needs: create_infra
+  build_deploy:
+    needs: infra
+    if: ${{ github.event.inputs.initial_deploy == 'true' }}
     runs-on: ubuntu-latest
     environment: bca_project
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+      - name: Download SSH Key PEM file
+        uses: actions/download-artifact@v2
+        with:
+          name: ssh-key
+          path: . 
+      - name: Correct PEM file permissions
+        run: chmod 600 ${{ github.event.inputs.ssh_key_name }}.pem
+      - name: SSH into EC2 Instance & Install Minikube, Build, and Apply Kubernetes Files
+        run: |
+          ssh -o StrictHostKeyChecking=no -i ${{ github.event.inputs.ssh_key_name }}.pem ubuntu@${{ needs.infra.outputs.instance-public-ip }} << 'EOF'
+          # Install Docker
+          curl -fsSL https://get.docker.com -o get-docker.sh
+          sudo sh get-docker.sh
+          sudo systemctl start docker
+          sudo systemctl enable docker
+          
+          # Install Minikube
+          curl -Lo minikube https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+          chmod +x minikube
+          sudo mv minikube /usr/local/bin/
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
+          # Start Minikube with Docker driver
+          sudo minikube start --driver=docker
+
+          # Install kubectl
+          curl -LO https://storage.googleapis.com/kubernetes-release/release/`curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt`/bin/linux/amd64/kubectl
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+          # Build Docker images
+          cd /home/ubuntu
+          mkdir app
+          cd app
+          git clone https://github.com/vinprogramming/docker-frontend-backend-db.git
+          cd docker-frontend-backend-db
+          
+          # Build frontend and backend images
+          echo "REACT_APP_API_URL=http://${{ needs.infra.outputs.instance-public-ip }}:3001/api" > frontend/.env.development
+          sudo docker build -t myfrontendimage:latest ./frontend
+          sudo docker build -t mybackendimage:latest ./backend
+          
+          # Apply Kubernetes resources
+          kubectl apply -f frontend-deployment.yaml
+          kubectl apply -f frontend-service.yaml
+          kubectl apply -f backend-deployment.yaml
+          kubectl apply -f backend-service.yaml
+          kubectl apply -f mongo-statefulset.yaml
+          kubectl apply -f mongo-service.yaml
+          EOF
+  update_code:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.update_code == 'true' }}
+    steps:
+      - name: Configure AWS CLI
+        uses: aws-actions/configure-aws-credentials@v1
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-south-1
+          aws-region: 'ap-south-1'
 
-      - name: Install Docker
+      - name: Retrieve Public IP of the EC2 Instance
+        id: get_ip
         run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo systemctl enable docker
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids ${{ github.event.inputs.ec2_instance_id }} --query 'Reservations[].Instances[].PublicIpAddress' --output text)
+          echo "INSTANCE_PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "::set-output name=instance_public_ip::$PUBLIC_IP"
 
-      - name: Log in to ECR
+      - name: Decode SSH Private Key
         run: |
-          aws ecr get-login-password --region ap-south-1 | sudo docker login --username AWS --password-stdin 438017212388.dkr.ecr.ap-south-1.amazonaws.com
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" | base64 --decode > ec2_ssh_key.pem
+          chmod 400 ec2_ssh_key.pem
 
-      - name: Build and Push Frontend Image
+      - name: Update Code and Restart Services on the EC2 Instance
         run: |
-          FRONTEND_REPO_URI="438017212388.dkr.ecr.ap-south-1.amazonaws.com/bca-todo/frontend"
-          cd frontend
-          sudo docker build -t frontend .
-          sudo docker tag frontend:latest $FRONTEND_REPO_URI:latest
-          sudo docker push $FRONTEND_REPO_URI:latest
-
-      - name: Build and Push Backend Image
-        run: |
-          BACKEND_REPO_URI="438017212388.dkr.ecr.ap-south-1.amazonaws.com/bca-todo/backend"
-          cd ../backend
-          sudo docker build -t backend .
-          sudo docker tag backend:latest $BACKEND_REPO_URI:latest
-          sudo docker push $BACKEND_REPO_URI:latest
-
-  deploy_app:
-    if: ${{ github.event.inputs.deploy_app == 'true' }}
-    needs: [create_infra, build_push]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
-
-      # Try to download the kubeconfig from the previous job artifact
-      - name: Download kubeconfig from artifact
-        uses: actions/download-artifact@v3
-        id: download_kubeconfig
-        with:
-          name: kubeconfig
-        continue-on-error: true
-
-      # If the kubeconfig artifact is not found, use the GitHub Secret to set up kubeconfig
-      - name: Set kubeconfig from secret if artifact not found
-        if: failure()  # Only run if the previous step failed
-        run: |
-          echo "${{ secrets.KUBECONFIG_SECRET }}" > $HOME/.kube/config
-
-      # Verify kubeconfig is set up correctly
-      - name: Install kubectl
-        run: |
-          curl -O https://s3.us-west-2.amazonaws.com/amazon-eks/1.31.0/2024-09-12/bin/linux/arm64/kubectl
-          chmod +x ./kubectl
-          sudo mv ./kubectl /usr/local/bin/kubectl
-
-      - name: Configure kubectl
-        run: |
-          export KUBECONFIG=$HOME/.kube/config
-          kubectl get nodes
-
-      # Deploy your application resources
-      - name: Deploy Application
-        run: |
-          kubectl apply -f frontend-deployment.yaml -n bca_project
-          kubectl apply -f frontend-service.yaml -n bca_project
-          kubectl apply -f backend-deployment.yaml -n bca_project
-          kubectl apply -f backend-service.yaml -n bca_project
-          kubectl apply -f mongo-statefulset.yaml -n bca_project
-          kubectl apply -f mongo-service.yaml -n bca_project
-
-      - name: Wait for LoadBalancer IP
-        run: |
-          echo "Waiting for LoadBalancer IP to be assigned..."
-          for i in {1..20}; do
-            EXTERNAL_IP=$(kubectl get svc frontend -n bca_project -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-            if [ -z "$EXTERNAL_IP" ]; then
-              echo "Waiting for LoadBalancer IP..."
-              sleep 30
-            else
-              echo "LoadBalancer IP assigned: $EXTERNAL_IP"
-              break
-            fi
-          done
-          if [ -z "$EXTERNAL_IP" ]; then
-            echo "Failed to get LoadBalancer IP after waiting for 10 minutes."
-            exit 1
-          fi
-
-      - name: Output LoadBalancer URL
-        run: |
-          EXTERNAL_IP=$(kubectl get svc frontend -n bca_project -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-          echo "Frontend Application URL: http://$EXTERNAL_IP"
+          ssh -o StrictHostKeyChecking=no -i ec2_ssh_key.pem ubuntu@${{ steps.get_ip.outputs.instance_public_ip }} << 'EOF'
+            cd /home/ubuntu/app/docker-frontend-backend-db 
+            git pull origin main
+            sudo docker-compose down
+            sudo docker-compose up -d
+          EOF
