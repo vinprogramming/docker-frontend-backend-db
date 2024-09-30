@@ -35,4 +35,3 @@ spec:
       resources:
         requests:
           storage: 1Gi
-      storageClassName: ebs-sc  # Ensure that your EBS StorageClass is applied
