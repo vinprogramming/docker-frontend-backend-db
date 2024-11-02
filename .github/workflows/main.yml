@@ -50,7 +50,7 @@ jobs:
           aws ec2 create-key-pair --key-name ${{ github.event.inputs.ssh_key_name }} --query 'KeyMaterial' --output text > ${{ github.event.inputs.ssh_key_name }}.pem
           chmod 600 ${{ github.event.inputs.ssh_key_name }}.pem
       - name: Upload PEM file as an artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: ssh-key
           path: ${{ github.event.inputs.ssh_key_name }}.pem
@@ -102,7 +102,7 @@ jobs:
     environment: bca_project
     steps:
       - name: Download SSH Key PEM file
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
           name: ssh-key
           path: . 
