@@ -50,7 +50,7 @@ jobs:
           aws ec2 create-key-pair --key-name ${{ github.event.inputs.ssh_key_name }} --query 'KeyMaterial' --output text > ${{ github.event.inputs.ssh_key_name }}.pem
           chmod 600 ${{ github.event.inputs.ssh_key_name }}.pem
       - name: Upload PEM file as an artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v2
         with:
           name: ssh-key
           path: ${{ github.event.inputs.ssh_key_name }}.pem
@@ -81,7 +81,6 @@ jobs:
           aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
           aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3000 --cidr 0.0.0.0/0
           aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3001 --cidr 0.0.0.0/0
-          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0
           echo "SG_ID=$SG_ID" >> $GITHUB_ENV
       
       - name: Launch EC2 Instance and Get Public IP
@@ -102,14 +101,14 @@ jobs:
     environment: bca_project
     steps:
       - name: Download SSH Key PEM file
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v2
         with:
           name: ssh-key
           path: . 
       - name: Correct PEM file permissions
         run: chmod 600 ${{ github.event.inputs.ssh_key_name }}.pem
       
-      - name: SSH into EC2 Instance & Setup Docker and kubectl
+      - name: SSH into EC2 Instance & Setup Docker and kubectl, then Reboot
         run: |
           ssh -o StrictHostKeyChecking=no -i ${{ github.event.inputs.ssh_key_name }}.pem ubuntu@${{ needs.infra.outputs.instance-public-ip }} << 'EOF'
           sudo apt update
@@ -123,21 +122,22 @@ jobs:
           curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
           sudo install minikube-linux-amd64 /usr/local/bin/minikube
           sudo usermod -aG docker ubuntu
+
+          # Reboot instance
+          sudo reboot
           EOF
 
-      - name: Reboot EC2 Instance via AWS CLI
-        run: |
-          aws ec2 reboot-instances --instance-ids ${{ needs.infra.outputs.instance-id }}
-          echo "Waiting for instance to reboot..."
-          sleep 60  # Adjust sleep time as necessary for reboot
+      - name: Wait for Instance to Reboot
+        run: sleep 60  # Adjust as needed for reboot time
 
-      - name: Retrieve New Public IP
+      - name: Retrieve Updated Public IP
         id: get_public_ip
         run: |
-          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids ${{ needs.infra.outputs.instance_id }} --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids ${{ needs.infra.outputs.instance-id }} --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
           echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "The public IP of the EC2 instance is: $PUBLIC_IP"
 
-      - name: SSH into EC2 Instance After Reboot & Complete Deployment
+      - name: SSH into EC2 Instance After Reboot & Start Minikube and Deploy
         run: |
           ssh -o StrictHostKeyChecking=no -i ${{ github.event.inputs.ssh_key_name }}.pem ubuntu@$PUBLIC_IP << 'EOF'
           # Start Minikube
@@ -205,9 +205,3 @@ jobs:
           # Restart NGINX to apply configuration
           sudo systemctl restart nginx
           EOF
-      - name: Retrieve New Public IP
-        id: get_new_public_ip
-        run: |
-          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids ${{ needs.infra.outputs.instance_id }} --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
-          echo "The public IP of the EC2 instance is: $PUBLIC_IP"
