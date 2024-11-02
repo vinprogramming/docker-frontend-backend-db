@@ -108,9 +108,10 @@ jobs:
       - name: Correct PEM file permissions
         run: chmod 600 ${{ github.event.inputs.ssh_key_name }}.pem
       
-      - name: SSH into EC2 Instance & Setup Docker and kubectl, then Reboot
+      - name: SSH into EC2 Instance & Setup Docker, kubectl, and Minikube
         run: |
           ssh -o StrictHostKeyChecking=no -i ${{ github.event.inputs.ssh_key_name }}.pem ubuntu@${{ needs.infra.outputs.instance-public-ip }} << 'EOF'
+          # Install Docker, kubectl, and Minikube
           sudo apt update
           sudo apt upgrade -y
           sudo apt install -y curl apt-transport-https docker.io
@@ -122,24 +123,8 @@ jobs:
           curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
           sudo install minikube-linux-amd64 /usr/local/bin/minikube
           sudo usermod -aG docker ubuntu
+          newgrp docker  # Apply Docker group without logout
 
-          # Reboot instance
-          sudo reboot
-          EOF
-
-      - name: Wait for Instance to Reboot
-        run: sleep 60  # Adjust as needed for reboot time
-
-      - name: Retrieve Updated Public IP
-        id: get_public_ip
-        run: |
-          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids ${{ needs.infra.outputs.instance-id }} --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
-          echo "The public IP of the EC2 instance is: $PUBLIC_IP"
-
-      - name: SSH into EC2 Instance After Reboot & Start Minikube and Deploy
-        run: |
-          ssh -o StrictHostKeyChecking=no -i ${{ github.event.inputs.ssh_key_name }}.pem ubuntu@$PUBLIC_IP << 'EOF'
           # Start Minikube
           minikube start --driver=docker
 
