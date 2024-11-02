@@ -127,7 +127,7 @@ jobs:
 
       - name: Reboot EC2 Instance via AWS CLI
         run: |
-          aws ec2 reboot-instances --instance-ids ${{ needs.infra.outputs.instance_id }}
+          aws ec2 reboot-instances --instance-ids ${{ needs.infra.outputs.instance-id }}
           echo "Waiting for instance to reboot..."
           sleep 60  # Adjust sleep time as necessary for reboot
 
