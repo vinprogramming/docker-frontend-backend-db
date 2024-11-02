@@ -1,2 +1,213 @@
-name: Deploy to AWS
-on: workflow_dispatch
+name: EC2 Deployment Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_infra:
+        required: true
+        default: false
+        description: Create Infrastructure on AWS?
+        type: boolean
+      initial_deploy:
+        required: true
+        default: false
+        description: Initial deployment? Depends on Create Infra
+        type: boolean
+      ssh_key_name:
+        required: true
+        description: SSH Key Name to create
+        type: string
+      update_code:
+        required: false
+        description: Update code?
+        type: boolean
+        default: false
+      instance_id:
+        required: false
+        description: EC2 instance id to update code
+        type: string
+
+jobs:
+  infra:
+    if: ${{ github.event.inputs.create_infra == 'true' }}
+    runs-on: ubuntu-latest
+    environment: bca_project
+    outputs:
+      instance-public-ip: ${{ steps.launch_instance.outputs.instance_public_ip }}
+      instance-id: ${{ steps.launch_instance.outputs.instance_id }}
+    steps:
+      - name: Install AWS CLI
+        run: sudo apt-get install awscli
+      - name: Configure AWS CLI
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+      - name: Create SSH Key Pair
+        id: create_key
+        run: |
+          aws ec2 create-key-pair --key-name ${{ github.event.inputs.ssh_key_name }} --query 'KeyMaterial' --output text > ${{ github.event.inputs.ssh_key_name }}.pem
+          chmod 600 ${{ github.event.inputs.ssh_key_name }}.pem
+      - name: Upload PEM file as an artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: ssh-key
+          path: ${{ github.event.inputs.ssh_key_name }}.pem
+      - name: Create VPC
+        id: create_vpc
+        run: |
+          echo "VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 --query 'Vpc.VpcId' --output text)" >> $GITHUB_ENV
+      
+      - name: Create Subnet
+        run: |
+          echo "SUBNET_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 --availability-zone ap-south-1a --query 'Subnet.SubnetId' --output text)" >> $GITHUB_ENV
+      
+      - name: Create Internet Gateway and Attach to VPC
+        run: |
+          IGW_ID=$(aws ec2 create-internet-gateway --query 'InternetGateway.InternetGatewayId' --output text)
+          aws ec2 attach-internet-gateway --vpc-id $VPC_ID --internet-gateway-id $IGW_ID
+          echo "IGW_ID=$IGW_ID" >> $GITHUB_ENV
+      
+      - name: Create Route Table and Associate with Subnet
+        run: |
+          RTB_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID --query 'RouteTable.RouteTableId' --output text)
+          aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $SUBNET_ID
+          aws ec2 create-route --route-table-id $RTB_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+      
+      - name: Create Security Group and Setup SSH
+        run: |
+          SG_ID=$(aws ec2 create-security-group --group-name my-ssh-sg --description "SSH access" --vpc-id $VPC_ID --query 'GroupId' --output text)
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3000 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3001 --cidr 0.0.0.0/0
+          aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0
+          echo "SG_ID=$SG_ID" >> $GITHUB_ENV
+      
+      - name: Launch EC2 Instance and Get Public IP
+        id: launch_instance
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances --image-id ami-03f4878755434977f --count 1 --instance-type t2.medium --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":20}}]" --key-name ${{ github.event.inputs.ssh_key_name }} --security-group-ids $SG_ID --subnet-id $SUBNET_ID --associate-public-ip-address --placement AvailabilityZone=ap-south-1a --query 'Instances[0].InstanceId' --output text)
+          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "::set-output name=instance_public_ip::$PUBLIC_IP"
+          echo "::set-output name=instance_id::$INSTANCE_ID"
+
+  build_deploy:
+    needs: infra
+    if: ${{ github.event.inputs.initial_deploy == 'true' }}
+    runs-on: ubuntu-latest
+    environment: bca_project
+    steps:
+      - name: Download SSH Key PEM file
+        uses: actions/download-artifact@v2
+        with:
+          name: ssh-key
+          path: . 
+      - name: Correct PEM file permissions
+        run: chmod 600 ${{ github.event.inputs.ssh_key_name }}.pem
+      
+      - name: SSH into EC2 Instance & Setup Docker and kubectl
+        run: |
+          ssh -o StrictHostKeyChecking=no -i ${{ github.event.inputs.ssh_key_name }}.pem ubuntu@${{ needs.infra.outputs.instance-public-ip }} << 'EOF'
+          sudo apt update
+          sudo apt upgrade -y
+          sudo apt install -y curl apt-transport-https docker.io
+          sudo systemctl enable docker
+          sudo systemctl start docker
+          curl -LO "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+          sudo install minikube-linux-amd64 /usr/local/bin/minikube
+          sudo usermod -aG docker ubuntu
+          EOF
+
+      - name: Reboot EC2 Instance via AWS CLI
+        run: |
+          aws ec2 reboot-instances --instance-ids ${{ needs.infra.outputs.instance_id }}
+          echo "Waiting for instance to reboot..."
+          sleep 60  # Adjust sleep time as necessary for reboot
+
+      - name: Retrieve New Public IP
+        id: get_public_ip
+        run: |
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids ${{ needs.infra.outputs.instance_id }} --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+
+      - name: SSH into EC2 Instance After Reboot & Complete Deployment
+        run: |
+          ssh -o StrictHostKeyChecking=no -i ${{ github.event.inputs.ssh_key_name }}.pem ubuntu@$PUBLIC_IP << 'EOF'
+          # Start Minikube
+          minikube start --driver=docker
+
+          # Clone and Build Images
+          git clone -b k8s https://github.com/vinprogramming/docker-frontend-backend-db.git
+          cd docker-frontend-backend-db
+          docker build -t frontend:latest ./frontend
+          docker build -t backend:latest ./backend
+
+          # Load images into Minikube
+          minikube image load frontend:latest
+          minikube image load backend:latest
+
+          # Apply Kubernetes manifests in sequence
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/mongo-pv.yaml
+          kubectl apply -f k8s/mongo-deployment.yaml
+          kubectl apply -f k8s/mongo-service.yaml
+          kubectl apply -f k8s/backend-deployment.yaml
+          kubectl apply -f k8s/backend-service.yaml
+          kubectl apply -f k8s/frontend-deployment.yaml
+          kubectl apply -f k8s/frontend-service.yaml
+
+          # Get Minikube IP
+          MINIKUBE_IP=$(minikube ip)
+
+          # Configure NGINX Reverse Proxy with Placeholder Replacement
+          sudo apt update && sudo apt install -y nginx
+          sudo bash -c "cat > /etc/nginx/nginx.conf" << 'EOT'
+          user www-data;
+          worker_processes auto;
+          pid /run/nginx.pid;
+          include /etc/nginx/modules-enabled/*.conf;
+
+          events {
+              worker_connections 768;
+          }
+
+          http {
+              sendfile on;
+              tcp_nopush on;
+              types_hash_max_size 2048;
+
+              server {
+                  listen 80;
+                  server_name REPLACE_WITH_HOST_IP;
+
+                  location / {
+                      proxy_pass http://REPLACE_WITH_MINIKUBE_IP:30000;
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                  }
+              }
+          }
+          EOT
+
+          # Replace placeholders in nginx.conf
+          sudo sed -i "s/REPLACE_WITH_HOST_IP/$PUBLIC_IP/g" /etc/nginx/nginx.conf
+          sudo sed -i "s/REPLACE_WITH_MINIKUBE_IP/$MINIKUBE_IP/g" /etc/nginx/nginx.conf
+
+          # Restart NGINX to apply configuration
+          sudo systemctl restart nginx
+          EOF
+      - name: Retrieve New Public IP
+        id: get_new_public_ip
+        run: |
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids ${{ needs.infra.outputs.instance_id }} --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "The public IP of the EC2 instance is: $PUBLIC_IP"
