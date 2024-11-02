@@ -195,4 +195,5 @@ jobs:
 
           # Restart NGINX to apply configuration
           sudo systemctl restart nginx
+          echo "YOU CAN ACCESS THE APP AT $PUBLIC_IP"
           EOF
