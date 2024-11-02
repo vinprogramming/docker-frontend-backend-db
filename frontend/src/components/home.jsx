@@ -16,6 +16,7 @@ import TodoForm from "./todo-form";
 const API_URL = process.env.REACT_APP_API_URL;
 
 const Home = () => {
+  console.log("API URL:", API_URL);
   const [todos, setTodos] = useState([]);
   const [modalOpen, setModalOpen] = useState(false);
   useEffect(() => {
@@ -25,14 +26,16 @@ const Home = () => {
     getData();
   }, []);
 
-  const getTodos = async () => {
-    try {
-      const res = await axios.get(`${API_URL}/todos`);
-      setTodos(res.data);
-    } catch (err) {
-      console.log(err);
-    }
-  };
+const getTodos = async () => {
+  try {
+    const res = await axios.get(`${API_URL}/todos`);
+    console.log("API Response:", res.data);
+    setTodos(Array.isArray(res.data) ? res.data : []); // Ensures todos is always an array
+  } catch (err) {
+    console.log(err);
+    setTodos([]); // Fallback to an empty array in case of error
+  }
+};
 
   const handleClick = async (id) => {
     try {
@@ -61,7 +64,7 @@ const Home = () => {
         <CardBody>
           <CardTitle tag="h1">Todos</CardTitle>
           <ListGroup>
-            {todos.map((todo) => {
+            {Array.isArray(todos) && todos.map((todo) => {
               return (
                 <ListGroupItem
                   title="Click this to complete."
